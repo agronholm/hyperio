@@ -106,7 +106,19 @@ current_time = trio.current_time
 #
 
 class ExceptionGroup(BaseExceptionGroup, trio.MultiError):
-    pass
+    def __new__(cls, message: str, exceptions: List[BaseException]):
+        return BaseExceptionGroup.__new__(cls, message, exceptions)
+
+    def __init__(self, message: str, exceptions: List[BaseException]):
+        for i, exc in enumerate(exceptions):
+            if isinstance(exc, trio.MultiError) and not isinstance(exc, ExceptionGroup):
+                excgroup = exceptions[i] = ExceptionGroup('multiple tasks failed', exc.exceptions)
+                excgroup.__cause__ = exc.__cause__
+                excgroup.__context__ = exc.__context__
+                excgroup.__traceback__ = exc.__traceback__
+
+        trio.MultiError.__init__(self, exceptions)
+        BaseExceptionGroup.__init__(self, message, exceptions)
 
 
 class TaskGroup(abc.TaskGroup):
@@ -127,7 +139,7 @@ class TaskGroup(abc.TaskGroup):
         try:
             return await self._nursery_manager.__aexit__(exc_type, exc_val, exc_tb)
         except trio.MultiError as exc:
-            raise ExceptionGroup(exc.exceptions) from None
+            raise ExceptionGroup('multiple tasks failed', exc.exceptions) from None
         finally:
             self._active = False
 

@@ -19,6 +19,29 @@ else:
 pytestmark = pytest.mark.anyio
 
 
+@pytest.fixture
+async def complex_exception_group():
+    async def raise_exception(e):
+        try:
+            await sleep(1)
+        finally:
+            raise e
+
+    async def subtask():
+        async with create_task_group() as tg:
+            tg.spawn(raise_exception, ValueError('foo'))
+            tg.spawn(raise_exception, RuntimeError('bar'))
+            tg.spawn(raise_exception, LookupError('baz'))
+
+    with pytest.raises(ExceptionGroup) as exc:
+        async with create_task_group() as tg:
+            tg.spawn(subtask)
+            tg.spawn(raise_exception, ValueError('xyz'))
+            tg.cancel_scope.cancel()
+
+    return exc.value
+
+
 async def async_error(text, delay=0.1):
     try:
         if delay:
@@ -356,11 +379,11 @@ async def test_exception_group_children():
 
     assert len(exc.value.exceptions) == 2
     assert sorted(str(e) for e in exc.value.exceptions) == ['task1', 'task2']
-    assert exc.match('^2 exceptions were raised in the task group:\n')
-    assert exc.match(r'Exception: task\d\n----')
+    assert exc.match('^ExceptionGroup: multiple tasks failed\n')
+    assert exc.match(r'Exception: task\d\n  ----')
     assert re.fullmatch(
-        r"<ExceptionGroup: Exception\('task[12]',?\), Exception\('task[12]',?\)>",
-        repr(exc.value))
+        r"ExceptionGroup\('multiple tasks failed', \[Exception\('task[12]',?\), "
+        r"Exception\('task[12]',?\)]\)", repr(exc.value))
 
 
 async def test_exception_group_host():
@@ -372,8 +395,70 @@ async def test_exception_group_host():
 
     assert len(exc.value.exceptions) == 2
     assert sorted(str(e) for e in exc.value.exceptions) == ['child', 'host']
-    assert exc.match('^2 exceptions were raised in the task group:\n')
-    assert exc.match(r'Exception: host\n----')
+    assert exc.match('^ExceptionGroup: multiple tasks failed\n')
+    assert exc.match(r'Exception: host\n  ----')
+
+
+@pytest.mark.parametrize('condition', [
+    pytest.param(ValueError, id='exception'),
+    pytest.param((ValueError,), id='tuple'),
+    pytest.param(lambda e: isinstance(e, ValueError), id='tuple')
+])
+async def test_exception_group_subgroup(complex_exception_group, condition):
+    subgroup = complex_exception_group.subgroup(condition)
+    assert len(subgroup.exceptions) == 2
+    assert isinstance(subgroup.exceptions[0], ValueError)
+    assert isinstance(subgroup.exceptions[1], ExceptionGroup)
+    assert len(subgroup.exceptions[1].exceptions) == 1
+    assert isinstance(subgroup.exceptions[1].exceptions[0], ValueError)
+    assert subgroup.__cause__ is complex_exception_group.__cause__
+    assert subgroup.__context__ is complex_exception_group.__context__
+    assert subgroup.__traceback__ is complex_exception_group.__traceback__
+
+
+async def test_exception_group_subgroup_no_matches(complex_exception_group):
+    assert complex_exception_group.subgroup(lambda e: False) is None
+
+
+async def test_exception_group_subgroup_everything_matches(complex_exception_group):
+    assert complex_exception_group.subgroup(lambda e: True) is complex_exception_group
+
+
+@pytest.mark.parametrize('condition', [
+    pytest.param(ValueError, id='exception'),
+    pytest.param((ValueError,), id='tuple'),
+    pytest.param(lambda e: isinstance(e, ValueError), id='tuple')
+])
+async def test_exception_group_split(complex_exception_group, condition):
+    matching_group, nonmatching_group = complex_exception_group.split(condition)
+    assert len(matching_group.exceptions) == 2
+    assert isinstance(matching_group.exceptions[0], ValueError)
+    assert isinstance(matching_group.exceptions[1], ExceptionGroup)
+    assert len(matching_group.exceptions[1].exceptions) == 1
+    assert isinstance(matching_group.exceptions[1].exceptions[0], ValueError)
+    assert matching_group.__cause__ is complex_exception_group.__cause__
+    assert matching_group.__context__ is complex_exception_group.__context__
+    assert matching_group.__traceback__ is complex_exception_group.__traceback__
+
+    assert len(nonmatching_group.exceptions) == 1
+    assert isinstance(nonmatching_group.exceptions[0], ExceptionGroup)
+    assert all(isinstance(exc, (RuntimeError, LookupError))
+               for exc in nonmatching_group.exceptions[0].exceptions)
+    assert nonmatching_group.__cause__ is complex_exception_group.__cause__
+    assert nonmatching_group.__context__ is complex_exception_group.__context__
+    assert nonmatching_group.__traceback__ is complex_exception_group.__traceback__
+
+
+async def test_exception_group_split_no_matches(complex_exception_group):
+    matching_group, nonmatching_group = complex_exception_group.split(lambda e: False)
+    assert matching_group is None
+    assert nonmatching_group is complex_exception_group
+
+
+async def test_exception_group_split_everything_matches(complex_exception_group):
+    matching_group, nonmatching_group = complex_exception_group.split(lambda e: True)
+    assert matching_group is complex_exception_group
+    assert nonmatching_group is None
 
 
 async def test_escaping_cancelled_exception():
