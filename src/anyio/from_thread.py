@@ -1,7 +1,8 @@
 import threading
-from asyncio import iscoroutine
+from asyncio import AbstractEventLoop, iscoroutine
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager, contextmanager
+from functools import partial
 from types import TracebackType
 from typing import (
     Any, AsyncContextManager, Callable, ContextManager, Coroutine, Dict, Generator, Iterable,
@@ -12,13 +13,16 @@ from ._core import _eventloop
 from ._core._eventloop import get_asynclib, get_cancelled_exc_class, threadlocals
 from ._core._synchronization import Event
 from ._core._tasks import CancelScope, create_task_group
+from .abc._lowlevel import AsynclibToken
 from .abc._tasks import TaskStatus
+from .lowlevel import current_token
 
 T_Retval = TypeVar('T_Retval')
 T_co = TypeVar('T_co')
 
 
-def run(func: Callable[..., Coroutine[Any, Any, T_Retval]], *args: object) -> T_Retval:
+def run(func: Callable[..., Coroutine[Any, Any, T_Retval]], *args: object,
+        asynclib_token: Optional[AsynclibToken] = None) -> T_Retval:
     """
     Call a coroutine function from a worker thread.
 
@@ -27,12 +31,21 @@ def run(func: Callable[..., Coroutine[Any, Any, T_Retval]], *args: object) -> T_
     :return: the return value of the coroutine function
 
     """
-    try:
-        asynclib = threadlocals.current_async_module
-    except AttributeError:
-        raise RuntimeError('This function can only be run from an AnyIO worker thread')
+    if asynclib_token is None:
+        try:
+            asynclib = threadlocals.current_async_module
+        except AttributeError:
+            raise RuntimeError('This function can only be run from an AnyIO worker thread')
 
-    return asynclib.run_async_from_thread(func, *args)
+        return asynclib.run_async_from_thread(func, *args)
+
+    if isinstance(asynclib_token, AbstractEventLoop):
+        return get_asynclib("asyncio").run_async_from_thread(func, *args, loop=asynclib_token)
+
+    if type(asynclib_token).__module__.startswith("trio."):
+        return get_asynclib("trio").run_async_from_thread(func, *args, trio_token=asynclib_token)
+
+    raise RuntimeError('Invalid token')
 
 
 def run_async_from_thread(func: Callable[..., Coroutine[Any, Any, T_Retval]],
@@ -42,7 +55,8 @@ def run_async_from_thread(func: Callable[..., Coroutine[Any, Any, T_Retval]],
     return run(func, *args)
 
 
-def run_sync(func: Callable[..., T_Retval], *args: object) -> T_Retval:
+def run_sync(func: Callable[..., T_Retval], *args: object,
+             asynclib_token: Optional[AsynclibToken] = None) -> T_Retval:
     """
     Call a function in the event loop thread from a worker thread.
 
@@ -51,12 +65,21 @@ def run_sync(func: Callable[..., T_Retval], *args: object) -> T_Retval:
     :return: the return value of the callable
 
     """
-    try:
-        asynclib = threadlocals.current_async_module
-    except AttributeError:
-        raise RuntimeError('This function can only be run from an AnyIO worker thread')
+    if asynclib_token is None:
+        try:
+            asynclib = threadlocals.current_async_module
+        except AttributeError:
+            raise RuntimeError('This function can only be run from an AnyIO worker thread')
 
-    return asynclib.run_sync_from_thread(func, *args)
+        return asynclib.run_sync_from_thread(func, *args)
+
+    if isinstance(asynclib_token, AbstractEventLoop):
+        return get_asynclib("asyncio").run_sync_from_thread(func, *args, loop=asynclib_token)
+
+    if type(asynclib_token).__module__.startswith("trio."):
+        return get_asynclib("trio").run_sync_from_thread(func, *args, trio_token=asynclib_token)
+
+    raise RuntimeError('Invalid token')
 
 
 def run_sync_from_thread(func: Callable[..., T_Retval], *args: object) -> T_Retval:
@@ -114,10 +137,8 @@ class _BlockingPortalTaskStatus(TaskStatus):
 class BlockingPortal:
     """An object that lets external threads run code in an asynchronous event loop."""
 
-    def __new__(cls) -> 'BlockingPortal':
-        return get_asynclib().BlockingPortal()
-
     def __init__(self) -> None:
+        self.token = current_token()
         self._event_loop_thread_id: Optional[int] = threading.get_ident()
         self._stop_event = Event()
         self._task_group = create_task_group()
@@ -205,7 +226,9 @@ class BlockingPortal:
             exception raised during its execution
 
         """
-        raise NotImplementedError
+        return run_sync(
+            partial(self._task_group.start_soon, name=name), self._call_func, func, args, kwargs,
+            future, asynclib_token=self.token)
 
     @overload
     def call(self, func: Callable[..., Coroutine[Any, Any, T_Retval]], *args: object) -> T_Retval:
